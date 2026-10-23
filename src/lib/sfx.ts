@@ -1,19 +1,64 @@
 let ctx: AudioContext | undefined;
+
 const muted = () => typeof localStorage !== 'undefined' && localStorage.getItem('ql-mute') === '1';
-const tone = (f: number, d: number, t = 0, type: OscillatorType = 'sine') => {
-  if (muted()) return;
-  ctx ??= new AudioContext();
-  const o = ctx.createOscillator(), g = ctx.createGain();
-  o.type = type; o.frequency.value = f; o.connect(g); g.connect(ctx.destination);
-  const s = ctx.currentTime + t;
-  g.gain.setValueAtTime(0.15, s); g.gain.exponentialRampToValueAtTime(0.001, s + d);
-  o.start(s); o.stop(s + d);
+
+const getCtx = () => {
+  if (typeof window === 'undefined') return undefined;
+  ctx ??= new (window.AudioContext || (window as any).webkitAudioContext)();
+  if (ctx.state === 'suspended') {
+    ctx.resume().catch(() => {});
+  }
+  return ctx;
 };
+
+const tone = (f: number, d: number, t = 0, type: OscillatorType = 'sine', gain = 0.15) => {
+  if (muted()) return;
+  const c = getCtx();
+  if (!c) return;
+  try {
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = type;
+    o.frequency.value = f;
+    o.connect(g);
+    g.connect(c.destination);
+    const s = c.currentTime + t;
+    g.gain.setValueAtTime(gain, s);
+    g.gain.exponentialRampToValueAtTime(0.0001, s + d);
+    o.start(s);
+    o.stop(s + d);
+  } catch {}
+};
+
 export const sfx = {
-  tap: () => tone(520, 0.08),
-  tick: () => tone(900, 0.05, 0, 'square'),
-  ok: () => { tone(660, 0.12); tone(880, 0.18, 0.12); },
-  bad: () => tone(160, 0.3, 0, 'sawtooth'),
-  start: () => { tone(440, 0.1); tone(660, 0.1, 0.1); tone(880, 0.2, 0.2); },
-  win: () => [523, 659, 784, 1047].forEach((f, i) => tone(f, 0.25, i * 0.14)),
+  tap: () => tone(600, 0.05, 0, 'sine', 0.1),
+  tick: () => tone(880, 0.04, 0, 'triangle', 0.12),
+  ok: () => {
+    tone(523.25, 0.1, 0, 'triangle', 0.14); // C5
+    tone(659.25, 0.12, 0.08, 'triangle', 0.15); // E5
+    tone(783.99, 0.22, 0.16, 'triangle', 0.16); // G5
+  },
+  bad: () => {
+    tone(220, 0.18, 0, 'sawtooth', 0.1);
+    tone(185, 0.25, 0.1, 'sawtooth', 0.08);
+  },
+  streak: () => {
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+      tone(f, 0.15, i * 0.07, 'sine', 0.14);
+    });
+  },
+  start: () => {
+    tone(440, 0.08, 0, 'triangle', 0.12);
+    tone(554.37, 0.09, 0.07, 'triangle', 0.13);
+    tone(659.25, 0.2, 0.15, 'triangle', 0.15);
+  },
+  win: () => {
+    [523.25, 659.25, 783.99, 1046.5, 1318.51].forEach((f, i) => {
+      tone(f, 0.28, i * 0.12, 'sine', 0.16);
+    });
+  },
+  clutch: () => {
+    tone(783.99, 0.1, 0, 'triangle', 0.15);
+    tone(1046.5, 0.2, 0.08, 'sine', 0.18);
+  },
 };

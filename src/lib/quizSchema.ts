@@ -29,7 +29,7 @@ export const quizSchema = z.object({
     fonts: z.array(z.string()).max(2).optional(),
     emoji: z.array(z.string()).max(8).optional(),
   }).optional(),
-  ruleset: z.enum(['classic', 'speed', 'streak', 'lives']).optional(),
+  ruleset: z.enum(['speed', 'fastest', 'classic', 'streak', 'lives']).optional(),
   questions: z.array(questionSchema).min(1).max(100),
 });
 

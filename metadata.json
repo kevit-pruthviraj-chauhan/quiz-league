@@ -1,0 +1,6 @@
+{
+  "name": "Quiz League",
+  "description": "Multiplayer pub-quiz and trivia platform with real-time rooms, custom themes, league table, and CSV exports.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

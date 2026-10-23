@@ -3,16 +3,33 @@ import type { Quiz, Question } from './quizSchema';
 import { detectTheme } from './theme';
 
 export const MAX_PLAYERS = 20;
-export type Ruleset = 'classic' | 'speed' | 'streak' | 'lives';
+export type Ruleset = 'speed' | 'fastest' | 'classic' | 'streak' | 'lives';
 export type Phase = 'lobby' | 'question' | 'reveal' | 'final';
 
 export interface Player { id: string; name: string; token: string; score: number; streak: number; lives: number; socketId?: string; connected: boolean }
 export interface LogRow { pid: string; qi: number; choice: number[]; correct: boolean; points: number; ms: number }
+export interface ResultBreakdown {
+  correct: boolean;
+  points: number;
+  basePoints: number;
+  speedBonus: number;
+  streakBonus: number;
+  clutchBonus: number;
+  isFastest: boolean;
+  fastestRank?: number;
+  streak: number;
+  multiplier?: number;
+  rank: number;
+  rankDelta: number;
+  reactionMs?: number;
+  ruleset: Ruleset;
+  algorithmNote?: string;
+}
 export interface Room {
   code: string; quiz: Quiz; ruleset: Ruleset; week?: number; phase: Phase; qi: number;
   startedAt: number; endsAt: number; stealAt: number; owner?: string; pausedLeft?: number; createdAt: number; hostSocket?: string; timer?: NodeJS.Timeout;
   players: Map<string, Player>; answers: Map<string, { choice: number[]; ms: number }>;
-  last: Map<string, { correct: boolean; points: number }>; log: LogRow[];
+  last: Map<string, ResultBreakdown>; log: LogRow[];
 }
 
 export const rooms = new Map<string, Room>();
@@ -94,28 +111,214 @@ export function reveal(room: Room) {
   const q = currentQ(room);
   room.phase = 'reveal';
   room.pausedLeft = undefined;
-  const win = q.type === 'fastest' || q.type === 'steal'
-    ? [...room.answers.entries()].filter(([, a]) => isCorrect(q, a.choice)).sort((x, y) => x[1].ms - y[1].ms)[0]?.[0]
-    : undefined;
+
+  // Snapshot pre-question ranks
+  const preRanks = new Map<string, number>();
+  [...room.players.values()]
+    .sort((a, b) => b.score - a.score)
+    .forEach((p, idx) => preRanks.set(p.id, idx + 1));
+
+  const totalPlayers = room.players.size;
+  const correctEntries = [...room.answers.entries()]
+    .filter(([, a]) => isCorrect(q, a.choice))
+    .sort((x, y) => x[1].ms - y[1].ms);
+  const fastestCorrectId = correctEntries[0]?.[0];
+
+  const roundResults = new Map<
+    string,
+    {
+      ok: boolean;
+      pts: number;
+      base: number;
+      speed: number;
+      streak: number;
+      clutch: number;
+      isFastest: boolean;
+      fastestRank?: number;
+      multiplier?: number;
+      note?: string;
+      ms?: number;
+    }
+  >();
+
   for (const p of activePlayers(room)) {
     const a = room.answers.get(p.id);
     const ok = !!a && isCorrect(q, a.choice);
-    let pts = 0;
-    if (q.type !== 'poll') {
-      if (ok) {
-        p.streak++;
-        const flat = room.ruleset === 'classic' || room.ruleset === 'lives';
-        pts = flat ? q.points : Math.round(q.points * (1 - 0.5 * Math.min(a!.ms / (q.timeLimit * 1000), 1)));
-        if (room.ruleset === 'streak') pts += Math.min(p.streak, 5) * 100; // combo bonus
-        if (win && p.id !== win) pts = 0; // only the first correct answer scores
+    let base = 0;
+    let speed = 0;
+    let streakBonus = 0;
+    let clutch = 0;
+    let multiplier: number | undefined;
+    let note: string | undefined;
+    const isFastest = ok && p.id === fastestCorrectId;
+    let fastestRank: number | undefined;
+
+    if (q.type === 'poll') {
+      base = 250;
+      note = 'Poll participation credit';
+    } else if (ok) {
+      p.streak++;
+
+      if (room.ruleset === 'speed') {
+        // --- 1. Industry Standard: Kahoot Speed Curve Formula ---
+        // Points = round((1 - (response_ms / (2 * time_limit_ms))) * max_points)
+        // 100% of max points for instantaneous answer, scaling down to 50% at the buzzer
+        const totalMs = q.timeLimit * 1000;
+        const timeFraction = Math.max(0, Math.min(1, (a?.ms ?? totalMs) / totalMs));
+        const kahootFactor = 1 - timeFraction * 0.5;
+        const totalScaled = Math.round(kahootFactor * q.points);
+        base = Math.round(q.points * 0.5); // guaranteed accuracy floor (50%)
+        speed = Math.max(0, totalScaled - base); // speed component (0% - 50%)
+
+        // Lightning reflex bonus: < 1.8s
+        if (a && a.ms <= 1800) speed += 100;
+        // Overall fastest responder bonus
+        if (isFastest && correctEntries.length > 1) speed += 150;
+
+        // Streak bonuses: 2 in a row: +100, 3: +200, 4: +350, 5+: +500
+        if (p.streak >= 2) {
+          streakBonus = p.streak === 2 ? 100 : p.streak === 3 ? 200 : p.streak === 4 ? 350 : 500;
+        }
+
+        // Underdog clutch comeback: bottom half team in top 3 speeds
+        const prevRank = preRanks.get(p.id) ?? 1;
+        if (prevRank > Math.ceil(totalPlayers / 2) && correctEntries.slice(0, 3).some(([id]) => id === p.id)) {
+          clutch = 100;
+        }
+
+        note = 'Kahoot Speed Curve: 50% Base + 50% Speed Scale';
+      } else if (room.ruleset === 'fastest') {
+        // --- 2. Fastest Finger First / Buzzer Race ---
+        const speedRank = correctEntries.findIndex(([id]) => id === p.id) + 1;
+        fastestRank = speedRank;
+
+        if (q.type === 'fastest') {
+          // Winner-takes-all sudden death round
+          if (speedRank === 1) {
+            base = q.points;
+            speed = 500;
+            note = '⚡ Fastest Finger Champion: Winner Takes All!';
+          } else {
+            base = 0;
+            note = 'Fastest Finger: Only the first correct response scores';
+          }
+        } else {
+          // Tiered podium buzzer
+          if (speedRank === 1) {
+            base = q.points;
+            speed = 500; // 🥇 Fastest Finger Jackpot
+            note = '🥇 1st Fastest Response (+500 Jackpot)';
+          } else if (speedRank === 2) {
+            base = Math.round(q.points * 0.8);
+            speed = 250; // 🥈 Speed Runner-up
+            note = '🥈 2nd Fastest Response (+250 Speed Bonus)';
+          } else if (speedRank === 3) {
+            base = Math.round(q.points * 0.65);
+            speed = 100; // 🥉 Bronze Speed
+            note = '🥉 3rd Fastest Response (+100 Podium Bonus)';
+          } else {
+            base = Math.round(q.points * 0.4);
+            note = `Speed Rank #${speedRank}: Accurate response`;
+          }
+        }
+      } else if (room.ruleset === 'classic') {
+        // --- 3. Normal Pub Quiz: 100% Pure Accuracy ---
+        base = q.points;
+        if (p.streak >= 2) streakBonus = Math.min(p.streak - 1, 6) * 50;
+        if (isFastest && correctEntries.length > 1) speed = 50;
+        note = 'Normal Pub Quiz: 100% Accuracy Points';
+      } else if (room.ruleset === 'streak') {
+        // --- 4. High-Stakes Streak Multipliers ---
+        multiplier = p.streak === 1 ? 1.0 : p.streak === 2 ? 1.25 : p.streak === 3 ? 1.5 : p.streak === 4 ? 1.75 : 2.0;
+        base = q.points;
+        streakBonus = Math.round(q.points * (multiplier - 1));
+        note = `Streak Multiplier: ${multiplier}x Combo Rush!`;
+      } else if (room.ruleset === 'lives') {
+        // --- 5. Survival / Battle Royale ---
+        base = q.points;
+        if (p.lives === 1) {
+          clutch = 300;
+          note = '🛡️ Last Stand: Survived on your final life (+300 bonus)';
+        } else {
+          note = `Survival Mode: ${p.lives} lives remaining`;
+        }
+      }
+
+      // Steal question bonus if applicable
+      if (q.type === 'steal') {
+        if (p.id === room.owner) {
+          base = Math.round(base * 1.25);
+        } else {
+          clutch += 200;
+          note = '⚔️ Heist Success: Stole question points!';
+        }
+      }
+    } else {
+      p.streak = 0;
+      if (room.ruleset === 'lives') {
+        p.lives = Math.max(0, p.lives - 1);
+        note = p.lives === 0 ? 'Eliminated: All lives lost' : `Incorrect: -1 life (${p.lives} left)`;
       } else {
-        p.streak = 0;
-        if (room.ruleset === 'lives') p.lives--;
+        note = 'Incorrect response';
       }
     }
-    p.score += pts;
-    room.last.set(p.id, { correct: ok, points: pts });
-    if (a) room.log.push({ pid: p.id, qi: room.qi, choice: a.choice, correct: ok, points: pts, ms: a.ms });
+
+    const totalPts = base + speed + streakBonus + clutch;
+    p.score += totalPts;
+
+    roundResults.set(p.id, {
+      ok,
+      pts: totalPts,
+      base,
+      speed,
+      streak: streakBonus,
+      clutch,
+      isFastest,
+      fastestRank,
+      multiplier,
+      note,
+      ms: a?.ms,
+    });
+
+    room.log.push({
+      pid: p.id,
+      qi: room.qi,
+      choice: a ? a.choice : [],
+      correct: ok,
+      points: totalPts,
+      ms: a ? a.ms : q.timeLimit * 1000,
+    });
+  }
+
+  // Calculate post-ranks and rank changes
+  const postRanks = new Map<string, number>();
+  [...room.players.values()]
+    .sort((a, b) => b.score - a.score)
+    .forEach((p, idx) => postRanks.set(p.id, idx + 1));
+
+  for (const p of activePlayers(room)) {
+    const r = roundResults.get(p.id);
+    const oldRank = preRanks.get(p.id) ?? 1;
+    const newRank = postRanks.get(p.id) ?? 1;
+    const rankDelta = oldRank - newRank;
+
+    room.last.set(p.id, {
+      correct: r?.ok ?? false,
+      points: r?.pts ?? 0,
+      basePoints: r?.base ?? 0,
+      speedBonus: r?.speed ?? 0,
+      streakBonus: r?.streak ?? 0,
+      clutchBonus: r?.clutch ?? 0,
+      isFastest: r?.isFastest ?? false,
+      fastestRank: r?.fastestRank,
+      streak: p.streak,
+      multiplier: r?.multiplier,
+      rank: newRank,
+      rankDelta,
+      reactionMs: r?.ms,
+      ruleset: room.ruleset,
+      algorithmNote: r?.note,
+    });
   }
 }
 
@@ -128,7 +331,54 @@ export function advance(room: Room): Phase {
 
 const board = (room: Room) =>
   [...room.players.values()].sort((a, b) => b.score - a.score)
-    .map((p, i) => ({ rank: i + 1, id: p.id, name: p.name, score: p.score, lives: p.lives, streak: p.streak }));
+    .map((p, i) => {
+      const lastRes = room.last.get(p.id);
+      return {
+        rank: i + 1,
+        id: p.id,
+        name: p.name,
+        score: p.score,
+        lives: p.lives,
+        streak: p.streak,
+        rankDelta: lastRes?.rankDelta ?? 0,
+      };
+    });
+
+export interface PlayerQuestionHistory {
+  qi: number;
+  qNum: number;
+  points: number;
+  cumScore: number;
+  correct: boolean;
+  streak: number;
+  reactionMs?: number;
+}
+
+export function computePlayerHistory(room: Room, pid: string): PlayerQuestionHistory[] {
+  let cum = 0;
+  let currStreak = 0;
+  const entries = room.log
+    .filter((l) => l.pid === pid)
+    .sort((a, b) => a.qi - b.qi);
+
+  return entries.map((l) => {
+    cum += l.points;
+    if (l.correct) {
+      currStreak += 1;
+    } else {
+      currStreak = 0;
+    }
+    return {
+      qi: l.qi,
+      qNum: l.qi + 1,
+      points: l.points,
+      cumScore: cum,
+      correct: l.correct,
+      streak: currStreak,
+      reactionMs: l.ms,
+    };
+  });
+}
 
 /** Per-role state. Correct answers are never sent before reveal. */
 export function view(room: Room, role: 'host' | 'player', pid?: string) {
@@ -144,12 +394,17 @@ export function view(room: Room, role: 'host' | 'player', pid?: string) {
     q: q && room.phase !== 'lobby' && room.phase !== 'final' ? {
       type: q.type, text: q.text, visual: q.visual, timeLimit: q.timeLimit,
       steal: q.type === 'steal' && room.owner ? { owner: room.players.get(room.owner)?.name, open: Date.now() >= room.stealAt } : undefined,
-      // players see option buttons only; the host screen shows option text
-      options: role === 'host' || room.phase !== 'question' ? q.options : q.options.map((_, i) => `#${i}`),
+      options: q.options,
       ...(revealed && room.phase === 'reveal' ? { correct: q.correct, explanation: q.explanation, dist } : {}),
     } : null,
     board: role === 'host' || room.phase !== 'question' ? (room.phase === 'final' ? b : b.slice(0, 5)) : undefined,
-    me: pid ? { ...b.find((x) => x.id === pid), result: room.last.get(pid), answered: room.answers.has(pid), isOwner: pid === room.owner } : undefined,
+    me: pid ? {
+      ...b.find((x) => x.id === pid),
+      result: room.last.get(pid),
+      answered: room.answers.has(pid),
+      isOwner: pid === room.owner,
+      history: computePlayerHistory(room, pid),
+    } : undefined,
   };
 }
 
